@@ -33,22 +33,22 @@ class DonorExposomeMapper:
             return None, None
         return Point(location.longitude, location.latitude), location
 
-    def fetch_radial_epa(self, lat, lon, radius_miles, program, status_placeholder, retries=3):
+    def fetch_radial_epa(self, lat, lon, radius_miles, program, status_placeholder, retries=4):
         """
-        Uses the EPA FRS Spatial API to fetch only the facilities within the exact radius.
-        Includes a retry/backoff mechanism for unstable government servers (HTTP 503/504)
-        and strict inner error handling to prevent corrupted data from crashing the batch.
+        Uses the EPA FRS Spatial API to fetch facilities.
+        Includes aggressive retry/backoff mechanism for timeouts, 500s, and dropped TCP connections.
         """
         url = f"{self.epa_spatial_url}?latitude83={lat}&longitude83={lon}&search_radius={radius_miles}&pgm_sys_acrnm={program}&output=JSON"
         
         for attempt in range(retries):
             try:
-                response = requests.get(url, timeout=20)
+                # Using a slightly longer timeout for heavy spatial queries
+                response = requests.get(url, timeout=25)
                 
                 # Handle temporary server overloads gracefully
                 if response.status_code in [500, 502, 503, 504]:
                     status_placeholder.text(f"EPA {program} server overloaded (HTTP {response.status_code}). Retrying {attempt + 1}/{retries}...")
-                    time.sleep(2) 
+                    time.sleep(3) 
                     continue
                 
                 # Catch any other non-200 responses
@@ -63,7 +63,6 @@ class DonorExposomeMapper:
                 fac_list = []
                 if 'Results' in data and 'FRSFacility' in data['Results']:
                     fac_list = data['Results']['FRSFacility']
-                    # If only one facility exists, the API returns a dict instead of a list
                     if isinstance(fac_list, dict):
                         fac_list = [fac_list]
                 elif 'FRSFacility' in data:
@@ -74,7 +73,6 @@ class DonorExposomeMapper:
                     fac_list = data
                     
                 for item in fac_list:
-                    # FRS Spatial API uses CamelCase keys
                     lat_val = item.get('Latitude83') or item.get('LATITUDE83')
                     lon_val = item.get('Longitude83') or item.get('LONGITUDE83')
                     name = item.get('FacilityName') or item.get('FACILITY_NAME') or 'Unknown Site'
@@ -82,12 +80,11 @@ class DonorExposomeMapper:
                     if not lat_val or not lon_val:
                         continue
                         
-                    # FIX: Safely parse coordinates to prevent a single typo from crashing the batch
                     try:
                         lat_float = float(lat_val)
                         lon_float = float(lon_val)
                     except ValueError:
-                        continue # Skip this specific corrupted facility
+                        continue 
                         
                     facilities.append({
                         'FACILITY_NAME': name,
@@ -100,9 +97,10 @@ class DonorExposomeMapper:
                 status_placeholder.text(f"Fetched {len(facilities)} {program} facilities within radius...")
                 return facilities
                 
-            except requests.exceptions.Timeout:
-                status_placeholder.text(f"EPA {program} server timed out. Retrying {attempt + 1}/{retries}...")
-                time.sleep(2)
+            # FIX: Explicitly catch ConnectionError (dropped TCP) alongside Timeouts to trigger the retry loop
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                status_placeholder.text(f"EPA {program} connection dropped/timed out. Retrying {attempt + 1}/{retries}...")
+                time.sleep(3)
                 continue
             except Exception as e:
                 st.warning(f"⚠️ Error parsing FRS Spatial API for {program}: {e}")
